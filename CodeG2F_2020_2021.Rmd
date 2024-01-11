@@ -1,0 +1,121 @@
+---
+title: "The development of resource-efficient genomic prediction models using multi-environment data"
+subtitle: "Example for developing GP models with BGLR"
+author: "Dylan Schoemaker"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: TRUE
+    toc_float: TRUE
+    toc_depth: 5
+toc-title: "Table of Contents"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, error = F,warning = FALSE)
+
+library(BGGE) #Use to build kernels
+library(BGLR)
+library(data.table)
+library(rrBLUP)
+library(dplyr)
+
+setwd("~/Genomes2Fields/008-MinObsTester_GP/") # Set to directory of interest
+```
+
+### Background 
+This HTML file describes and demonstrates the necessary steps and R code required to build GP models as utilized for this analysis within the manuscript. For this study, one model was used and that model is described by [Sousa et al. (2017)](https://academic.oup.com/g3journal/article/7/6/1995/6029859). The model contains a single GxE variance parameter and the additive genetic relationships among hybrids were modeled using *in silico* hybrid genotypes. We then tested how the combination of training data impacts GP accuracy and research allocation decisions in a plant breeding program.
+
+All phenotypic data (BLUEs) and genotypic data used for the analysis are included in this GitHub Resource-efficient_genomic_prediction_models. The files PhenotypicDataG2F_2020_2021.csv and GeneticDataG2F_2020_2021.txt contain the stage 1 BLUEs and 5,000 genetic markers used for developing genomic prediction models in this study, respectively. For the phenotypic data file, the column 'pheno' identifies the three different phenotypes studied in this paper, grain yield (GY), plant height (PH), and grain moisture (GM).
+
+#### Steps
+1. Develop training set (TS) and the validation set (VS)
+2. Create the incidence matrix for the fixed effect environments
+3. Calculate relationship matrix and GxE kernel
+4. Run BGLR
+5. Obtain estimated genotypic values of hybrids
+
+### Process
+Below demonstrates GP model development in the context of predicting unobserved hybrids in unobserved environments, or CV00. For this example, the PHP02-derived hybrids are  used and the trait of interest is  grain yield. The training set (TS) consists of all environments where PHP02 hybrids were evaluated except WIH1_2020. The environment WIH1_2020 serves as the validation set (VS). Ten percent of the hybrids in the environment will be predicted. For the manuscript, the process was repeated 25 times for each of the environments for each question addressed in the study. 
+
+All basic data manipulation is done using the R package data.table.
+
+#### Step 1: Develop the training set (TS) and the validation set (VS)
+```{r}
+pheno_dt = fread("~/Genomes2Fields/003-Stage2_Analysis/Results/PhenotypicDataG2F_2020_2021.csv") # Change path as needed
+geno_dt = fread("~/Genomes2Fields/002-GenotypeData/Results/G2FGenoData/GeneticDataG2F_2020_2021.txt") # Change path as needed
+  colnames(geno_dt)[1] = 'Hybrid'
+  
+# Subset out trait of interest and hybrids of interest
+pheno_ts = pheno_dt[pheno=='GY' & tester =='PHP02' & environment !='WIH1_2020']
+pheno_vs = pheno_dt[pheno=='GY' & tester =='PHP02' & environment =='WIH1_2020']
+
+# Subset out 10% of the hybrids 
+  vs_sub = sample_n(pheno_vs,size =  nrow(pheno_vs)*.10)  
+    vs_sub$predicted.value = NA 
+
+# Combine data and format for BGLR
+modDT<-rbind(pheno_ts,vs_sub)
+
+# Format phenotype data  
+bgformat<-modDT[,c('environment','pedigree','predicted.value')]
+  bgformat<-bgformat[order(bgformat$pedigree)]
+
+# Format genotype data 
+hybrids_interestDT<-geno_dt[Hybrid %in% modDT$pedigree]
+  hybrids_interestDT<-hybrids_interestDT[order(hybrids_interestDT$Hybrid)]
+hybrids_interest <- as.matrix(hybrids_interestDT[,-c(1)])
+  rownames(hybrids_interest)<-hybrids_interestDT$Hybrid
+```
+The data is subset out and formatted necessary for BGLR and building GP  models. Below calculates the relationship matrix and corresponding kernel.
+
+#### Step 2: Create the incidence matrix for the fixed effect environments
+```{r}
+#Incidence Matrix for environments random
+  Ze <- model.matrix(~factor(bgformat$environment)-1) # environment design matrix
+```
+
+#### Step 3: Calculate relationship matrix and GxE kernel
+```{r}
+# Subset out the matricies for environments random  
+MDs<- getK(Y = bgformat, X = hybrids_interest, kernel = 'GK', model = 'MDs') 
+  G_kernelMDs<-MDs$G$Kernel
+  GxE_kernelMDs<-MDs$GE$Kernel  
+```
+
+#### Step 4: Run BGLR
+All prediction models were developed using default parameters for burnin, nIter, and thin 
+```{r}
+# Prepare to run model
+residualWeight<-bgformat$S2.weight  
+  yblues<-bgformat$predicted.value
+#.. list kernels together for BGLR    
+  ETAgE<-list(ENV=list(X=Ze,model='FIXED'), Grm=list(K=G_kernelMDs,model='RKHS'), 
+              EGrm=list(K=GxE_kernelMDs,model='RKHS')) 
+```
+ Now that the fixed effects and kernels are listed together, the model can be run. The verbose is set to False so no output will be displayed. 
+```{r}
+fmMDs <- BGLR(y=yblues,ETA=ETAgE,nIter=1500,burnIn=500,
+              thin=5,verbose = FALSE,weights = residualWeight) 
+```
+
+#### Step 5: Obtain estimated genotypic values of hybrids
+```{r}
+# Observed BLUEs of the environment in the VS
+ObsbluesDT<-pheno_vs[pedigree %in% vs_sub$pedigree]  
+  ObsbluesDT<-ObsbluesDT[order(ObsbluesDT$pedigree)] 
+  ObsbluesDT$geno_env = paste0(ObsbluesDT$pedigree,'_',ObsbluesDT$environment)
+  
+# Predicted genotypic values  of interest   
+bgval<-fmMDs$ETA$Grm$u   + fmMDs$mu
+  names(bgval)<-paste0(bgformat$pedigree,'_',bgformat$environment)
+  GenoDT = bgval[names(bgval) %in% ObsbluesDT$geno_env]
+  
+# Correlate  
+  rBGLR<-cor(GenoDT,ObsbluesDT$predicted.value)  
+```
+The prediction accuracy is `r rBGLR`. The above process was repeated for each each environment on a trait and tester basis across all the analyses. For the eight environments with all three testers, GP models were developed to predict across testers to compare prediction accuracy between and within testers. Comparison of testers that do not share a common set of environments leads to the confounding of tester and environment effect. 
+
+
+
